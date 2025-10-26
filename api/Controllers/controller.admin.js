@@ -1,14 +1,13 @@
-// Controllers/controller.admin.js
 const Admin = require("../models/Admin");
 const jwt = require("jsonwebtoken");
 const { sendMail } = require("../lib/mailer");
 const { isObjectId } = require("../utils/ids");
+const { audit } = require("../lib/audit");      // ⬅️ NEW
+const logger = require("../lib/logger");        // ⬅️ NEW
 
-// Use env var in prod; fallback prevents local dev from breaking
 const JWT_SECRET = process.env.JWT_SECRET || "hey";
 const FROM_EMAIL = process.env.SMTP_USER || "helasuwa@zohomail.com";
 
-/* ------------------------------- util: regex ------------------------------- */
 function escapeRegex(text = "") {
   return String(text).replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
 }
@@ -23,19 +22,11 @@ function toRegex(text = "", flags = "i") {
 exports.addAdmin = async (req, res) => {
   try {
     const { email, name, phone, roleName, allocatedWork, password } = req.body;
-
-    const newAdmin = new Admin({
-      email,
-      name,
-      password, // TODO: bcrypt hash in production
-      phone,
-      roleName,
-      allocatedWork,
-    });
-
+    const newAdmin = new Admin({ email, name, password, phone, roleName, allocatedWork });
     await newAdmin.save();
 
-    // fire-and-forget (won't crash dev if creds absent)
+    audit("admin.create", { reqId: req.id, actor: req.user?.email, target: email });
+
     await sendMail({
       from: FROM_EMAIL,
       to: email,
@@ -51,7 +42,7 @@ Thank you.`,
 
     return res.json("Admin Added");
   } catch (err) {
-    console.error(err);
+    logger.error({ err, reqId: req.id }, "add admin failed");
     return res.status(500).json({ error: "Failed to add admin" });
   }
 };
@@ -65,12 +56,12 @@ exports.deleteAdmin = async (req, res) => {
     const deleted = await Admin.findByIdAndDelete(aid);
     if (!deleted) return res.status(404).send({ status: "Staff not found" });
 
+    audit("admin.delete", { reqId: req.id, actor: req.user?.email, targetId: aid });
+
     return res.status(200).send({ status: "Staff deleted" });
   } catch (err) {
-    console.log(err);
-    return res
-      .status(500)
-      .send({ status: "Error with deleting the admin", error: err.message });
+    logger.error({ err, reqId: req.id }, "delete admin failed");
+    return res.status(500).send({ status: "Error with deleting the admin", error: err.message });
   }
 };
 
@@ -79,19 +70,24 @@ exports.loginAdmin = async (req, res) => {
   const { email, password } = req.body;
   try {
     const admin = await Admin.findOne({ email });
-    if (!admin) return res.status(401).send({ rst: "invalid admin" });
+    if (!admin) {
+      audit("admin.login.failed", { reqId: req.id, email, reason: "not_found", ip: req.ip });
+      return res.status(200).send({ rst: "invalid admin" });
+    }
 
-    // plaintext compare to match your current DB; switch to bcrypt later
-    if (password !== admin.password) return res.status(401).send({ rst: "incorrect password" });
+    if (password !== admin.password) {
+      audit("admin.login.failed", { reqId: req.id, email, reason: "bad_password", ip: req.ip });
+      return res.status(200).send({ rst: "incorrect password" });
+    }
 
-    const token = jwt.sign(
-      { id: admin._id, role: admin.roleName, email: admin.email },
-      JWT_SECRET,
-      { expiresIn: "1h" }
-    );
+    const token = jwt.sign({ id: admin._id, role: admin.roleName, email: admin.email }, JWT_SECRET, {
+      expiresIn: "1h",
+    });
+
+    audit("admin.login.success", { reqId: req.id, email, ip: req.ip });
     return res.status(200).send({ rst: "success", data: admin, tok: token });
   } catch (error) {
-    console.error(error);
+    logger.error({ err: error, reqId: req.id }, "login error");
     return res.status(500).send({ error: "Login failed" });
   }
 };
@@ -101,6 +97,7 @@ exports.checkToken = async (req, res) => {
   try {
     const header = req.headers.authorization || "";
     if (!header.startsWith("Bearer ")) {
+      audit("admin.token.missing", { reqId: req.id, ip: req.ip });
       return res.status(401).send({ rst: "no token", error: "Missing Bearer token" });
     }
 
@@ -109,16 +106,20 @@ exports.checkToken = async (req, res) => {
     try {
       payload = jwt.verify(token, JWT_SECRET);
     } catch (err) {
-      console.error("JWT verify failed:", err.message);
+      audit("admin.token.invalid", { reqId: req.id, reason: err.name });
       return res.status(403).send({ rst: "invalid token", error: "Invalid or expired token" });
     }
 
     const admin = await Admin.findOne({ email: payload.email });
-    if (!admin) return res.status(404).send({ rst: "not found" });
+    if (!admin) {
+      audit("admin.token.user_not_found", { reqId: req.id, email: payload.email });
+      return res.status(404).send({ rst: "not found" });
+    }
 
+    audit("admin.token.valid", { reqId: req.id, email: payload.email });
     return res.status(200).send({ rst: "checked", admin });
   } catch (err) {
-    console.error(err);
+    logger.error({ err, reqId: req.id }, "token check failed");
     return res.status(500).send({ error: "Token check failed" });
   }
 };
@@ -129,7 +130,7 @@ exports.getAllAdmins = async (req, res) => {
     const admins = await Admin.find();
     return res.json(admins);
   } catch (err) {
-    console.log(err);
+    logger.error({ err, reqId: req.id }, "getAllAdmins failed");
     return res.status(500).json({ error: "Failed to fetch admins" });
   }
 };
@@ -145,11 +146,8 @@ exports.getAdminById = async (req, res) => {
 
     return res.status(200).send({ status: "Staff fetched", staff });
   } catch (err) {
-    console.log(err.message);
-    return res.status(500).send({
-      status: "Error in getting staff details",
-      error: err.message,
-    });
+    logger.error({ err, reqId: req.id }, "getAdminById failed");
+    return res.status(500).send({ status: "Error in getting staff details", error: err.message });
   }
 };
 
@@ -166,7 +164,7 @@ exports.searchAdmins = async (req, res) => {
     const results = await Admin.find(filter);
     return res.json(results);
   } catch (error) {
-    console.error(error);
+    logger.error({ err: error, reqId: req.id }, "searchAdmins failed");
     const msg = error && error.message === "Query too long" ? "Query too long" : "Server error";
     return res.status(400).json({ error: msg });
   }
@@ -183,6 +181,8 @@ exports.updateAdmin = async (req, res) => {
 
     const updated = await Admin.findByIdAndUpdate(sid, updateStaff, { new: true });
     if (!updated) return res.status(404).send({ status: "Staff not found" });
+
+    audit("admin.update", { reqId: req.id, actor: req.user?.email, targetId: sid });
 
     await sendMail({
       from: FROM_EMAIL,
@@ -201,11 +201,8 @@ Thank you.`,
 
     return res.status(200).send({ status: "Staff updated" });
   } catch (err) {
-    console.log(err);
-    return res.status(500).send({
-      status: "Error with updating information",
-      error: err.message,
-    });
+    logger.error({ err, reqId: req.id }, "updateAdmin failed");
+    return res.status(500).send({ status: "Error with updating information", error: err.message });
   }
 };
 
@@ -217,16 +214,14 @@ exports.updateAdminWithPassword = async (req, res) => {
 
     const { name, email, phone, roleName, allocatedWork, password } = req.body;
     const updateStaff = { name, email, phone, roleName, allocatedWork, password }; // TODO: hash
-
     const updated = await Admin.findByIdAndUpdate(sid, updateStaff);
     if (!updated) return res.status(404).send({ status: "Staff not found" });
 
+    audit("admin.update.with_password", { reqId: req.id, actor: req.user?.email, targetId: sid });
+
     return res.status(200).send({ status: "Staff updated" });
   } catch (err) {
-    console.log(err);
-    return res.status(500).send({
-      status: "Error with updating information",
-      error: err.message,
-    });
+    logger.error({ err, reqId: req.id }, "updateAdminWithPassword failed");
+    return res.status(500).send({ status: "Error with updating information", error: err.message });
   }
 };

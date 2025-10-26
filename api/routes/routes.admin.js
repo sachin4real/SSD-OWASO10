@@ -7,7 +7,7 @@ const auth = require("../middleware/auth");
 router.post("/login", adminController.loginAdmin);
 router.get("/check", adminController.checkToken);
 
-// Protected (require any authenticated admin)
+// Protected
 router.post("/add", auth(), adminController.addAdmin);
 router.delete("/delete/:id", auth(), adminController.deleteAdmin);
 router.get("/", auth(), adminController.getAllAdmins);
